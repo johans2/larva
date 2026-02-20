@@ -284,10 +284,11 @@ func doPostBuild() {
 }
 
 func doExec() {
-	exe := filepath.Join(buildDir, exeName(cfg.Project.Name))
+	exe, _ := filepath.Abs(filepath.Join(buildDir, exeName(cfg.Project.Name)))
+	dir, _ := filepath.Abs(buildDir)
 	fmt.Printf("  running %s\n", exe)
 	cmd := exec.Command(exe)
-	cmd.Dir = buildDir
+	cmd.Dir = dir
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Stdin = os.Stdin
@@ -312,11 +313,13 @@ func doCommand(c Command) {
 		case step == "post_build":
 			doPostBuild()
 		case strings.HasPrefix(step, "exec:"):
-			path := strings.TrimPrefix(step, "exec:")
-			path = strings.ReplaceAll(path, "{output}", buildDir)
-			path = strings.ReplaceAll(path, "{exe}", exeName(cfg.Project.Name))
-			cmd := exec.Command(path)
-			cmd.Dir = buildDir
+			p := strings.TrimPrefix(step, "exec:")
+			p = strings.ReplaceAll(p, "{output}", buildDir)
+			p = strings.ReplaceAll(p, "{exe}", exeName(cfg.Project.Name))
+			absPath, _ := filepath.Abs(p)
+			absDir, _ := filepath.Abs(buildDir)
+			cmd := exec.Command(absPath)
+			cmd.Dir = absDir
 			cmd.Stdout = os.Stdout
 			cmd.Stderr = os.Stderr
 			cmd.Stdin = os.Stdin
