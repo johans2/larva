@@ -82,7 +82,7 @@ func main() {
 
 	switch cmd {
 	case "--version", "-v":
-		fmt.Printf("larva v%s\n", version)
+		fmt.Printf("%s v%s\n", teal("larva"), version)
 		return
 	case "--help", "-h", "help":
 		printHelp()
@@ -91,7 +91,7 @@ func main() {
 
 	// Parse config
 	if _, err := toml.DecodeFile("larva.toml", &cfg); err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to read larva.toml: %s\n", err)
+		printError("error:", err)
 		os.Exit(1)
 	}
 
@@ -188,7 +188,7 @@ func buildTarget(name string, t Target) []string {
 		sources = append(sources, matches...)
 	}
 	if len(sources) == 0 {
-		fmt.Fprintf(os.Stderr, "Warning: no sources found for target '%s'\n", name)
+		printError("warning:", "no sources found for target '"+name+"'")
 		return nil
 	}
 
@@ -223,7 +223,7 @@ func buildTarget(name string, t Target) []string {
 			args = append(args, src, "-o", obj)
 			run(compiler, args...)
 		} else {
-			fmt.Printf("  skip %s (unchanged)\n", filepath.Base(src))
+			printSkip(filepath.Base(src))
 		}
 		objects = append(objects, obj)
 	}
@@ -264,7 +264,7 @@ func doPostBuild() {
 				}
 			}
 			if copied > 0 {
-				fmt.Printf("  copied %d file(s) matching %s\n", copied, pat)
+				printCopied(copied, pat)
 			}
 		}
 
@@ -286,7 +286,7 @@ func doPostBuild() {
 func doExec() {
 	exe, _ := filepath.Abs(filepath.Join(buildDir, exeName(cfg.Project.Name)))
 	dir, _ := filepath.Abs(buildDir)
-	fmt.Printf("  running %s\n", exe)
+	printRunning(exe)
 	cmd := exec.Command(exe)
 	cmd.Dir = dir
 	cmd.Stdout = os.Stdout
@@ -299,10 +299,10 @@ func doClean() {
 	if c, ok := cfg.Commands["clean"]; ok {
 		for _, dir := range c.Remove {
 			os.RemoveAll(dir)
-			fmt.Printf("  removed %s\n", dir)
+			printRemoved(dir)
 		}
 	}
-	fmt.Println("Cleaned.")
+	printSuccess("Cleaned.")
 }
 
 func doCommand(c Command) {
@@ -329,30 +329,76 @@ func doCommand(c Command) {
 }
 
 func printHelp() {
-	fmt.Printf("larva v%s - a simple C/C++ build system\n\n", version)
-	fmt.Printf("Usage: larva [command]\n\n")
+	fmt.Printf("%s v%s - a simple C/C++ build system\n\n", teal("larva"), version)
+	fmt.Printf("Usage: %s [command]\n\n", teal("larva"))
 	fmt.Printf("Commands:\n")
-	fmt.Printf("  build      Debug build (default)\n")
-	fmt.Printf("  release    Optimized release build\n")
-	fmt.Printf("  clean      Remove build artifacts\n")
+	fmt.Printf("  %s      Debug build (default)\n", teal("build"))
+	fmt.Printf("  %s    Optimized release build\n", teal("release"))
+	fmt.Printf("  %s      Remove build artifacts\n", teal("clean"))
 	fmt.Printf("\n")
 	fmt.Printf("Flags:\n")
-	fmt.Printf("  --help     Show this help message\n")
-	fmt.Printf("  --version  Show version\n")
+	fmt.Printf("  %s     Show this help message\n", teal("--help"))
+	fmt.Printf("  %s  Show version\n", teal("--version"))
 	fmt.Printf("\n")
 	fmt.Printf("Additional commands are defined in larva.toml under [commands].\n")
 }
 
 func printUsage() {
-	fmt.Printf("larva v%s\n\n", version)
-	fmt.Printf("Usage: larva [command]\n\n")
-	fmt.Printf("  build      Debug build (default)\n")
-	fmt.Printf("  release    Optimized release build\n")
+	fmt.Printf("%s v%s\n\n", teal("larva"), version)
+	fmt.Printf("Usage: %s [command]\n\n", teal("larva"))
+	fmt.Printf("  %s      Debug build (default)\n", teal("build"))
+	fmt.Printf("  %s    Optimized release build\n", teal("release"))
 	for name, c := range cfg.Commands {
-		fmt.Printf("  %-10s %s\n", name, c.Description)
+		fmt.Printf("  %s %s\n", teal(fmt.Sprintf("%-10s", name)), c.Description)
 	}
 	fmt.Printf("\n")
-	fmt.Printf("Run 'larva --help' for more info.\n")
+	fmt.Printf("Run '%s' for more info.\n", teal("larva --help"))
+}
+
+// --- Colors (256-color ANSI) ---
+
+const (
+	colorReset   = "\033[0m"
+	colorTeal    = "\033[38;5;37m"  // main larva color — green/blue teal
+	colorDim     = "\033[38;5;245m" // dimmed default prints
+	colorBright  = "\033[38;5;48m"  // bright green for success
+	colorErr     = "\033[38;5;208m" // orange-red for errors
+	colorBold    = "\033[1m"
+)
+
+func teal(s string) string   { return colorTeal + s + colorReset }
+func dim(s string) string    { return colorDim + s + colorReset }
+func bright(s string) string { return colorBold + colorBright + s + colorReset }
+func errclr(s string) string { return colorBold + colorErr + s + colorReset }
+
+// --- Print functions ---
+
+func printSkip(file string) {
+	fmt.Printf("  %s %s\n", dim("skip"), dim(file))
+}
+
+func printCopied(count int, pattern string) {
+	fmt.Printf("  %s %d file(s) matching %s\n", teal("copied"), count, pattern)
+}
+
+func printRunning(exe string) {
+	fmt.Printf("  %s %s\n", teal("running"), exe)
+}
+
+func printRemoved(dir string) {
+	fmt.Printf("  %s %s\n", teal("removed"), dir)
+}
+
+func printSuccess(msg string) {
+	fmt.Println(bright(msg))
+}
+
+func printError(msg string, detail interface{}) {
+	fmt.Fprintf(os.Stderr, "%s %v\n", errclr(msg), detail)
+}
+
+func printCmd(name string, args string) {
+	fmt.Printf("  %s %s\n", teal(name), dim(args))
 }
 
 // --- Helpers ---
@@ -391,12 +437,12 @@ func exeName(name string) string {
 }
 
 func run(name string, args ...string) {
-	fmt.Printf("  %s %s\n", name, strings.Join(args, " "))
+	printCmd(name, strings.Join(args, " "))
 	cmd := exec.Command(name, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "FAILED: %s\n", err)
+		printError("FAILED:", err)
 		os.Exit(1)
 	}
 }
