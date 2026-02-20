@@ -1,5 +1,3 @@
-//go:build ignore
-
 package main
 
 import (
@@ -23,7 +21,8 @@ type Config struct {
 }
 
 type Project struct {
-	Name string `toml:"name"`
+	Name       string `toml:"name"`
+	BuildCache string `toml:"buildcache"`
 }
 
 type Target struct {
@@ -63,14 +62,33 @@ type Command struct {
 
 // --- Globals ---
 
+const version = "0.1.0"
+
 var (
 	cfg      Config
 	plat     string
 	mode     string // "debug" or "release"
 	buildDir string
+	cacheDir string
 )
 
 func main() {
+	// Handle flags that don't need a config file
+	cmd := "build"
+	mode = "debug"
+	if len(os.Args) > 1 {
+		cmd = os.Args[1]
+	}
+
+	switch cmd {
+	case "--version", "-v":
+		fmt.Printf("larva v%s\n", version)
+		return
+	case "--help", "-h", "help":
+		printHelp()
+		return
+	}
+
 	// Parse config
 	if _, err := toml.DecodeFile("larva.toml", &cfg); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to read larva.toml: %s\n", err)
@@ -84,12 +102,6 @@ func main() {
 		plat = "linux"
 	}
 
-	// Parse command
-	cmd := "build"
-	mode = "debug"
-	if len(os.Args) > 1 {
-		cmd = os.Args[1]
-	}
 	if cmd == "release" {
 		mode = "release"
 		cmd = "build"
@@ -103,6 +115,12 @@ func main() {
 				break
 			}
 		}
+	}
+
+	// Resolve cache dir for object files (defaults to buildDir if not set)
+	cacheDir = cfg.Project.BuildCache
+	if cacheDir == "" {
+		cacheDir = buildDir
 	}
 
 	switch cmd {
@@ -129,6 +147,7 @@ func main() {
 
 func doBuild() {
 	os.MkdirAll(buildDir, 0o755)
+	os.MkdirAll(cacheDir, 0o755)
 
 	// Build all targets in dependency order
 	built := map[string][]string{} // target name -> object files
@@ -194,7 +213,7 @@ func buildTarget(name string, t Target) []string {
 	// Compile each source
 	var objects []string
 	for _, src := range sources {
-		obj := filepath.Join(buildDir, strings.TrimSuffix(filepath.Base(src), ext)+".o")
+		obj := filepath.Join(cacheDir, strings.TrimSuffix(filepath.Base(src), ext)+".o")
 		if needsRecompile(src, obj) {
 			args := []string{"-c", stdFlag, "-w"}
 			args = append(args, flags...)
@@ -306,14 +325,31 @@ func doCommand(c Command) {
 	}
 }
 
+func printHelp() {
+	fmt.Printf("larva v%s - a simple C/C++ build system\n\n", version)
+	fmt.Printf("Usage: larva [command]\n\n")
+	fmt.Printf("Commands:\n")
+	fmt.Printf("  build      Debug build (default)\n")
+	fmt.Printf("  release    Optimized release build\n")
+	fmt.Printf("  clean      Remove build artifacts\n")
+	fmt.Printf("\n")
+	fmt.Printf("Flags:\n")
+	fmt.Printf("  --help     Show this help message\n")
+	fmt.Printf("  --version  Show version\n")
+	fmt.Printf("\n")
+	fmt.Printf("Additional commands are defined in larva.toml under [commands].\n")
+}
+
 func printUsage() {
-	fmt.Printf("larva - build system\n\n")
+	fmt.Printf("larva v%s\n\n", version)
 	fmt.Printf("Usage: larva [command]\n\n")
 	fmt.Printf("  build      Debug build (default)\n")
 	fmt.Printf("  release    Optimized release build\n")
 	for name, c := range cfg.Commands {
 		fmt.Printf("  %-10s %s\n", name, c.Description)
 	}
+	fmt.Printf("\n")
+	fmt.Printf("Run 'larva --help' for more info.\n")
 }
 
 // --- Helpers ---
