@@ -21,8 +21,9 @@ type Config struct {
 }
 
 type Project struct {
-	Name       string `toml:"name"`
-	BuildCache string `toml:"buildcache"`
+	Name       string            `toml:"name"`
+	BuildCache string            `toml:"buildcache"`
+	Vars       map[string]string `toml:"vars"`
 }
 
 type Target struct {
@@ -214,8 +215,9 @@ func buildTarget(name string, t Target) []string {
 	var objects []string
 	for _, src := range sources {
 		obj := filepath.Join(cacheDir, strings.TrimSuffix(filepath.Base(src), ext)+".o")
-		if needsRecompile(src, obj) {
-			args := []string{"-c", stdFlag, "-w"}
+		dep := strings.TrimSuffix(obj, ".o") + ".d"
+		if needsRecompile(src, obj, dep) {
+			args := []string{"-c", stdFlag, "-w", "-MMD", "-MF", dep}
 			args = append(args, flags...)
 			for _, inc := range includes {
 				args = append(args, "-I", inc)
@@ -257,7 +259,7 @@ func doPostBuild() {
 			copied := 0
 			for _, f := range files {
 				dst := filepath.Join(buildDir, filepath.Base(f))
-				if needsRecompile(f, dst) {
+				if isNewer(f, dst) {
 					data, _ := os.ReadFile(f)
 					os.WriteFile(dst, data, 0o644)
 					copied++
@@ -276,7 +278,7 @@ func doPostBuild() {
 			cmdStr = pb.RunLinux
 		}
 		if cmdStr != "" {
-			cmdStr = strings.ReplaceAll(cmdStr, "{output}", buildDir)
+			cmdStr = expandVars(cmdStr)
 			parts := strings.Fields(cmdStr)
 			run(parts[0], parts[1:]...)
 		}
@@ -314,8 +316,7 @@ func doCommand(c Command) {
 			doPostBuild()
 		case strings.HasPrefix(step, "exec:"):
 			p := strings.TrimPrefix(step, "exec:")
-			p = strings.ReplaceAll(p, "{output}", buildDir)
-			p = strings.ReplaceAll(p, "{exe}", exeName(cfg.Project.Name))
+			p = expandVars(p)
 			absPath, _ := filepath.Abs(p)
 			absDir, _ := filepath.Abs(buildDir)
 			cmd := exec.Command(absPath)
@@ -417,16 +418,74 @@ func sourceExt(lang string) string {
 	return ".c"
 }
 
-func needsRecompile(src, obj string) bool {
+func isNewer(src, dst string) bool {
 	srcInfo, err := os.Stat(src)
 	if err != nil {
 		return true
 	}
+	dstInfo, err := os.Stat(dst)
+	if err != nil {
+		return true
+	}
+	return srcInfo.ModTime().After(dstInfo.ModTime())
+}
+
+func needsRecompile(src, obj, dep string) bool {
 	objInfo, err := os.Stat(obj)
 	if err != nil {
 		return true
 	}
-	return srcInfo.ModTime().After(objInfo.ModTime())
+	objTime := objInfo.ModTime()
+
+	// Check source file
+	srcInfo, err := os.Stat(src)
+	if err != nil {
+		return true
+	}
+	if srcInfo.ModTime().After(objTime) {
+		return true
+	}
+
+	// Check header dependencies from .d file
+	for _, h := range parseDeps(dep) {
+		if hInfo, err := os.Stat(h); err == nil && hInfo.ModTime().After(objTime) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func parseDeps(depFile string) []string {
+	data, err := os.ReadFile(depFile)
+	if err != nil {
+		return nil
+	}
+
+	// .d format: "target: dep1 dep2 dep3 ..."
+	// Continuations use backslash-newline
+	content := strings.ReplaceAll(string(data), "\\\n", " ")
+	content = strings.ReplaceAll(content, "\\\r\n", " ")
+
+	// Strip the "target:" prefix
+	if idx := strings.Index(content, ":"); idx >= 0 {
+		content = content[idx+1:]
+	}
+
+	var deps []string
+	for _, d := range strings.Fields(content) {
+		deps = append(deps, d)
+	}
+	return deps
+}
+
+func expandVars(s string) string {
+	s = strings.ReplaceAll(s, "{output}", buildDir)
+	s = strings.ReplaceAll(s, "{exe}", exeName(cfg.Project.Name))
+	for k, v := range cfg.Project.Vars {
+		s = strings.ReplaceAll(s, "{"+k+"}", v)
+	}
+	return s
 }
 
 func exeName(name string) string {
