@@ -179,6 +179,7 @@ func doBuild() {
 	}
 
 	doPostBuild()
+	printSuccess("Build succeeded.")
 }
 
 func buildTarget(name string, t Target) []string {
