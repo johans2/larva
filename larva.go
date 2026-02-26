@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/md5"
 	"fmt"
 	"os"
 	"os/exec"
@@ -134,6 +135,8 @@ func main() {
 		doPostBuild()
 	case "clean":
 		doClean()
+	case "vs":
+		doGenerateVS()
 	default:
 		// Check custom commands
 		if c, ok := cfg.Commands[cmd]; ok {
@@ -206,6 +209,10 @@ func buildTarget(name string, t Target) []string {
 		flags = t.Release.Flags
 	} else {
 		flags = t.Debug.Flags
+	}
+
+	for i, f := range flags {
+		flags[i] = expandVars(f)
 	}
 
 	// Determine compiler and standard
@@ -337,6 +344,7 @@ func printHelp() {
 	fmt.Printf("  %s      Debug build (default)\n", teal("build"))
 	fmt.Printf("  %s    Optimized release build\n", teal("release"))
 	fmt.Printf("  %s      Remove build artifacts\n", teal("clean"))
+	fmt.Printf("  %s         Generate Visual Studio NMake solution\n", teal("vs"))
 	fmt.Printf("\n")
 	fmt.Printf("Flags:\n")
 	fmt.Printf("  %s     Show this help message\n", teal("--help"))
@@ -350,6 +358,7 @@ func printUsage() {
 	fmt.Printf("Usage: %s [command]\n\n", teal("larva"))
 	fmt.Printf("  %s      Debug build (default)\n", teal("build"))
 	fmt.Printf("  %s    Optimized release build\n", teal("release"))
+	fmt.Printf("  %s         Generate Visual Studio solution\n", teal("vs"))
 	for name, c := range cfg.Commands {
 		fmt.Printf("  %s %s\n", teal(fmt.Sprintf("%-10s", name)), c.Description)
 	}
@@ -481,6 +490,8 @@ func parseDeps(depFile string) []string {
 }
 
 func expandVars(s string) string {
+	cwd, _ := os.Getwd()
+	s = strings.ReplaceAll(s, "{projectRoot}", filepath.ToSlash(cwd))
 	s = strings.ReplaceAll(s, "{output}", buildDir)
 	s = strings.ReplaceAll(s, "{exe}", exeName(cfg.Project.Name))
 	for k, v := range cfg.Project.Vars {
@@ -505,4 +516,270 @@ func run(name string, args ...string) {
 		printError("FAILED:", err)
 		os.Exit(1)
 	}
+}
+
+// --- VS Solution Generation ---
+
+func doGenerateVS() {
+	// Find the executable target
+	var mainName string
+	var mainTarget Target
+	for name, t := range cfg.Targets {
+		if t.Kind == "executable" {
+			mainName = name
+			mainTarget = t
+			break
+		}
+	}
+	if mainName == "" {
+		printError("error:", "no executable target found")
+		os.Exit(1)
+	}
+
+	projectName := cfg.Project.Name
+	guid := projectGUID(projectName)
+
+	// Collect include paths from main target + deps (windows platform), deduplicated
+	var includes []string
+	seenInc := map[string]bool{}
+	addInc := func(path string) {
+		if !seenInc[path] {
+			seenInc[path] = true
+			includes = append(includes, path)
+		}
+	}
+	for _, inc := range mainTarget.Includes {
+		addInc(inc)
+	}
+	if p, ok := mainTarget.Platform["windows"]; ok {
+		for _, inc := range p.Includes {
+			addInc(inc)
+		}
+	}
+	for _, dep := range mainTarget.Deps {
+		if dt, ok := cfg.Targets[dep]; ok {
+			for _, inc := range dt.Includes {
+				addInc(inc)
+			}
+			if p, ok := dt.Platform["windows"]; ok {
+				for _, inc := range p.Includes {
+					addInc(inc)
+				}
+			}
+		}
+	}
+
+	// Convert to backslash paths and join with semicolons for VS
+	var vsIncludes []string
+	for _, inc := range includes {
+		vsIncludes = append(vsIncludes, filepath.FromSlash(inc))
+	}
+	includeStr := strings.Join(vsIncludes, ";")
+
+	// Collect preprocessor definitions from -D flags
+	collectDefines := func(flags []string) string {
+		var defs []string
+		for _, f := range flags {
+			if strings.HasPrefix(f, "-D") {
+				def := f[2:]
+				if strings.Contains(def, "{projectRoot}") {
+					continue
+				}
+				defs = append(defs, def)
+			}
+		}
+		return strings.Join(defs, ";")
+	}
+	debugDefs := collectDefines(mainTarget.Debug.Flags)
+	releaseDefs := collectDefines(mainTarget.Release.Flags)
+
+	// Collect source files from main target and all deps
+	var compileFiles, headerFiles []string
+	seen := map[string]bool{}
+
+	addSources := func(t Target) {
+		for _, pat := range t.Sources {
+			matches, _ := filepath.Glob(pat)
+			for _, m := range matches {
+				m = filepath.Clean(m)
+				if seen[m] {
+					continue
+				}
+				seen[m] = true
+				ext := strings.ToLower(filepath.Ext(m))
+				switch ext {
+				case ".cpp", ".cc", ".cxx", ".c":
+					compileFiles = append(compileFiles, m)
+				case ".h", ".hpp":
+					headerFiles = append(headerFiles, m)
+				}
+			}
+		}
+	}
+
+	for _, dep := range mainTarget.Deps {
+		if dt, ok := cfg.Targets[dep]; ok {
+			addSources(dt)
+		}
+	}
+	addSources(mainTarget)
+
+	// Scan include directories for header files
+	for _, inc := range includes {
+		for _, pattern := range []string{"*.h", "*.hpp"} {
+			matches, _ := filepath.Glob(filepath.Join(inc, pattern))
+			for _, m := range matches {
+				m = filepath.Clean(m)
+				if !seen[m] {
+					seen[m] = true
+					headerFiles = append(headerFiles, m)
+				}
+			}
+		}
+	}
+
+	// Resolve output exe path
+	outputExe := projectName + ".exe"
+	if p, ok := mainTarget.Platform["windows"]; ok && p.Output != "" {
+		outputExe = filepath.FromSlash(filepath.Join(p.Output, projectName+".exe"))
+	}
+
+	// Write .vcxproj
+	vcxprojPath := projectName + ".vcxproj"
+	vcxproj := generateVcxproj(projectName, guid, includeStr, debugDefs, releaseDefs, outputExe, compileFiles, headerFiles)
+	os.WriteFile(vcxprojPath, []byte(vcxproj), 0o644)
+
+	// Write .sln
+	slnPath := projectName + ".sln"
+	sln := generateSln(projectName, guid, vcxprojPath)
+	os.WriteFile(slnPath, []byte(sln), 0o644)
+
+	printSuccess("Generated Visual Studio solution:")
+	fmt.Printf("  %s\n", teal(slnPath))
+	fmt.Printf("  %s\n", teal(vcxprojPath))
+}
+
+func projectGUID(name string) string {
+	h := md5.Sum([]byte(name))
+	return fmt.Sprintf("{%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
+		h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7],
+		h[8], h[9], h[10], h[11], h[12], h[13], h[14], h[15])
+}
+
+func generateVcxproj(name, guid, includes, debugDefs, releaseDefs, output string, compileFiles, headerFiles []string) string {
+	var b strings.Builder
+
+	b.WriteString("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n")
+	b.WriteString("<Project DefaultTargets=\"Build\" xmlns=\"http://schemas.microsoft.com/developer/msbuild/2003\">\n")
+
+	// Project configurations
+	b.WriteString("  <ItemGroup Label=\"ProjectConfigurations\">\n")
+	for _, conf := range []string{"Debug", "Release"} {
+		b.WriteString(fmt.Sprintf("    <ProjectConfiguration Include=\"%s|x64\">\n", conf))
+		b.WriteString(fmt.Sprintf("      <Configuration>%s</Configuration>\n", conf))
+		b.WriteString("      <Platform>x64</Platform>\n")
+		b.WriteString("    </ProjectConfiguration>\n")
+	}
+	b.WriteString("  </ItemGroup>\n")
+
+	// Globals
+	b.WriteString("  <PropertyGroup Label=\"Globals\">\n")
+	b.WriteString("    <VCProjectVersion>17.0</VCProjectVersion>\n")
+	b.WriteString(fmt.Sprintf("    <ProjectGuid>%s</ProjectGuid>\n", guid))
+	b.WriteString("    <Keyword>MakeFileProj</Keyword>\n")
+	b.WriteString(fmt.Sprintf("    <ProjectName>%s</ProjectName>\n", name))
+	b.WriteString("  </PropertyGroup>\n")
+
+	b.WriteString("  <Import Project=\"$(VCTargetsPath)\\Microsoft.Cpp.Default.props\" />\n")
+
+	// Configuration property groups
+	for _, conf := range []struct {
+		name  string
+		debug bool
+	}{{"Debug", true}, {"Release", false}} {
+		b.WriteString(fmt.Sprintf("  <PropertyGroup Condition=\"'$(Configuration)|$(Platform)'=='%s|x64'\" Label=\"Configuration\">\n", conf.name))
+		b.WriteString("    <ConfigurationType>Makefile</ConfigurationType>\n")
+		if conf.debug {
+			b.WriteString("    <UseDebugLibraries>true</UseDebugLibraries>\n")
+		} else {
+			b.WriteString("    <UseDebugLibraries>false</UseDebugLibraries>\n")
+		}
+		b.WriteString("    <PlatformToolset>v143</PlatformToolset>\n")
+		b.WriteString("  </PropertyGroup>\n")
+	}
+
+	b.WriteString("  <Import Project=\"$(VCTargetsPath)\\Microsoft.Cpp.props\" />\n")
+
+	// NMake settings — Debug
+	b.WriteString("  <PropertyGroup Condition=\"'$(Configuration)|$(Platform)'=='Debug|x64'\">\n")
+	b.WriteString("    <NMakeBuildCommandLine>larva build</NMakeBuildCommandLine>\n")
+	b.WriteString(fmt.Sprintf("    <NMakeOutput>%s</NMakeOutput>\n", output))
+	b.WriteString("    <NMakeCleanCommandLine>larva clean</NMakeCleanCommandLine>\n")
+	b.WriteString("    <NMakeReBuildCommandLine>larva clean &amp;&amp; larva build</NMakeReBuildCommandLine>\n")
+	b.WriteString(fmt.Sprintf("    <NMakeIncludeSearchPath>%s</NMakeIncludeSearchPath>\n", includes))
+	b.WriteString(fmt.Sprintf("    <NMakePreprocessorDefinitions>%s</NMakePreprocessorDefinitions>\n", debugDefs))
+	b.WriteString("  </PropertyGroup>\n")
+
+	// NMake settings — Release
+	b.WriteString("  <PropertyGroup Condition=\"'$(Configuration)|$(Platform)'=='Release|x64'\">\n")
+	b.WriteString("    <NMakeBuildCommandLine>larva release</NMakeBuildCommandLine>\n")
+	b.WriteString(fmt.Sprintf("    <NMakeOutput>%s</NMakeOutput>\n", output))
+	b.WriteString("    <NMakeCleanCommandLine>larva clean</NMakeCleanCommandLine>\n")
+	b.WriteString("    <NMakeReBuildCommandLine>larva clean &amp;&amp; larva release</NMakeReBuildCommandLine>\n")
+	b.WriteString(fmt.Sprintf("    <NMakeIncludeSearchPath>%s</NMakeIncludeSearchPath>\n", includes))
+	b.WriteString(fmt.Sprintf("    <NMakePreprocessorDefinitions>%s</NMakePreprocessorDefinitions>\n", releaseDefs))
+	b.WriteString("  </PropertyGroup>\n")
+
+	// Source files (ClCompile)
+	if len(compileFiles) > 0 {
+		b.WriteString("  <ItemGroup>\n")
+		for _, f := range compileFiles {
+			b.WriteString(fmt.Sprintf("    <ClCompile Include=\"%s\" />\n", filepath.FromSlash(f)))
+		}
+		b.WriteString("  </ItemGroup>\n")
+	}
+
+	// Header files (ClInclude)
+	if len(headerFiles) > 0 {
+		b.WriteString("  <ItemGroup>\n")
+		for _, f := range headerFiles {
+			b.WriteString(fmt.Sprintf("    <ClInclude Include=\"%s\" />\n", filepath.FromSlash(f)))
+		}
+		b.WriteString("  </ItemGroup>\n")
+	}
+
+	b.WriteString("  <Import Project=\"$(VCTargetsPath)\\Microsoft.Cpp.targets\" />\n")
+	b.WriteString("</Project>\n")
+
+	return b.String()
+}
+
+func generateSln(name, projectGuid, vcxprojPath string) string {
+	typeGUID := "{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}"
+
+	var b strings.Builder
+	b.WriteString("\xEF\xBB\xBF\r\n") // UTF-8 BOM
+	b.WriteString("Microsoft Visual Studio Solution File, Format Version 12.00\r\n")
+	b.WriteString("# Visual Studio Version 17\r\n")
+	b.WriteString("VisualStudioVersion = 17.0.31903.59\r\n")
+	b.WriteString("MinimumVisualStudioVersion = 10.0.40219.1\r\n")
+	b.WriteString(fmt.Sprintf("Project(\"%s\") = \"%s\", \"%s\", \"%s\"\r\n", typeGUID, name, vcxprojPath, projectGuid))
+	b.WriteString("EndProject\r\n")
+	b.WriteString("Global\r\n")
+	b.WriteString("\tGlobalSection(SolutionConfigurationPlatforms) = preSolution\r\n")
+	b.WriteString("\t\tDebug|x64 = Debug|x64\r\n")
+	b.WriteString("\t\tRelease|x64 = Release|x64\r\n")
+	b.WriteString("\tEndGlobalSection\r\n")
+	b.WriteString("\tGlobalSection(ProjectConfigurationPlatforms) = postSolution\r\n")
+	b.WriteString(fmt.Sprintf("\t\t%s.Debug|x64.ActiveCfg = Debug|x64\r\n", projectGuid))
+	b.WriteString(fmt.Sprintf("\t\t%s.Debug|x64.Build.0 = Debug|x64\r\n", projectGuid))
+	b.WriteString(fmt.Sprintf("\t\t%s.Release|x64.ActiveCfg = Release|x64\r\n", projectGuid))
+	b.WriteString(fmt.Sprintf("\t\t%s.Release|x64.Build.0 = Release|x64\r\n", projectGuid))
+	b.WriteString("\tEndGlobalSection\r\n")
+	b.WriteString("\tGlobalSection(SolutionProperties) = preSolution\r\n")
+	b.WriteString("\t\tHideSolutionNode = FALSE\r\n")
+	b.WriteString("\tEndGlobalSection\r\n")
+	b.WriteString("EndGlobal\r\n")
+
+	return b.String()
 }
