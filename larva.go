@@ -23,6 +23,7 @@ type Config struct {
 
 type Project struct {
 	Name       string            `toml:"name"`
+	Compiler   string            `toml:"compiler"`
 	BuildCache string            `toml:"buildcache"`
 	Vars       map[string]string `toml:"vars"`
 }
@@ -415,10 +416,19 @@ func printCmd(name string, args string) {
 // --- Helpers ---
 
 func resolveCompiler(lang string) (compiler, stdFlag string) {
-	if strings.HasPrefix(lang, "c++") {
-		return "g++", "-std=" + lang
+	isCpp := strings.HasPrefix(lang, "c++")
+	switch cfg.Project.Compiler {
+	case "clang":
+		if isCpp {
+			return "clang++", "-std=" + lang
+		}
+		return "clang", "-std=" + lang
+	default:
+		if isCpp {
+			return "g++", "-std=" + lang
+		}
+		return "gcc", "-std=" + lang
 	}
-	return "gcc", "-std=" + lang
 }
 
 func sourceExt(lang string) string {
