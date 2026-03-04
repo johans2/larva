@@ -29,21 +29,23 @@ type Project struct {
 }
 
 type Target struct {
-	Kind     string              `toml:"kind"`     // "executable" or "object"
-	Language string              `toml:"language"` // "c99", "c++20"
-	Sources  []string            `toml:"sources"`
-	Includes []string            `toml:"includes"`
-	Deps     []string            `toml:"deps"`
-	Platform map[string]Platform `toml:"platform"`
-	Debug    BuildMode           `toml:"debug"`
-	Release  BuildMode           `toml:"release"`
+	Kind           string              `toml:"kind"`     // "executable" or "object"
+	Language       string              `toml:"language"` // "c99", "c++20"
+	Sources        []string            `toml:"sources"`
+	Includes       []string            `toml:"includes"`
+	SystemIncludes []string            `toml:"system_includes"`
+	Deps           []string            `toml:"deps"`
+	Platform       map[string]Platform `toml:"platform"`
+	Debug          BuildMode           `toml:"debug"`
+	Release        BuildMode           `toml:"release"`
 }
 
 type Platform struct {
-	Includes []string `toml:"includes"`
-	LibDirs  []string `toml:"libdirs"`
-	Links    []string `toml:"links"`
-	Output   string   `toml:"output"`
+	Includes       []string `toml:"includes"`
+	SystemIncludes []string `toml:"system_includes"`
+	LibDirs        []string `toml:"libdirs"`
+	Links          []string `toml:"links"`
+	Output         string   `toml:"output"`
 }
 
 type BuildMode struct {
@@ -200,8 +202,10 @@ func buildTarget(name string, t Target) []string {
 
 	// Resolve includes
 	includes := t.Includes
+	systemIncludes := t.SystemIncludes
 	if p, ok := t.Platform[plat]; ok {
 		includes = append(includes, p.Includes...)
+		systemIncludes = append(systemIncludes, p.SystemIncludes...)
 	}
 
 	// Resolve flags
@@ -226,10 +230,13 @@ func buildTarget(name string, t Target) []string {
 		obj := filepath.Join(cacheDir, strings.TrimSuffix(filepath.Base(src), ext)+".o")
 		dep := strings.TrimSuffix(obj, ".o") + ".d"
 		if needsRecompile(src, obj, dep) {
-			args := []string{"-c", stdFlag, "-w", "-MMD", "-MF", dep}
+			args := []string{"-c", stdFlag, "-Wall", "-Wextra", "-MMD", "-MF", dep}
 			args = append(args, flags...)
 			for _, inc := range includes {
 				args = append(args, "-I", inc)
+			}
+			for _, inc := range systemIncludes {
+				args = append(args, "-isystem", inc)
 			}
 			args = append(args, src, "-o", obj)
 			run(compiler, args...)
@@ -561,8 +568,14 @@ func doGenerateVS() {
 	for _, inc := range mainTarget.Includes {
 		addInc(inc)
 	}
+	for _, inc := range mainTarget.SystemIncludes {
+		addInc(inc)
+	}
 	if p, ok := mainTarget.Platform["windows"]; ok {
 		for _, inc := range p.Includes {
+			addInc(inc)
+		}
+		for _, inc := range p.SystemIncludes {
 			addInc(inc)
 		}
 	}
@@ -571,8 +584,14 @@ func doGenerateVS() {
 			for _, inc := range dt.Includes {
 				addInc(inc)
 			}
+			for _, inc := range dt.SystemIncludes {
+				addInc(inc)
+			}
 			if p, ok := dt.Platform["windows"]; ok {
 				for _, inc := range p.Includes {
+					addInc(inc)
+				}
+				for _, inc := range p.SystemIncludes {
 					addInc(inc)
 				}
 			}
