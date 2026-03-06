@@ -34,6 +34,7 @@ type Target struct {
 	Sources        []string            `toml:"sources"`
 	Includes       []string            `toml:"includes"`
 	SystemIncludes []string            `toml:"system_includes"`
+	Flags          []string            `toml:"flags"`
 	Deps           []string            `toml:"deps"`
 	Platform       map[string]Platform `toml:"platform"`
 	Debug          BuildMode           `toml:"debug"`
@@ -230,7 +231,9 @@ func buildTarget(name string, t Target) []string {
 		obj := filepath.Join(cacheDir, strings.TrimSuffix(filepath.Base(src), ext)+".o")
 		dep := strings.TrimSuffix(obj, ".o") + ".d"
 		if needsRecompile(src, obj, dep) {
-			args := []string{"-c", stdFlag, "-Wall", "-Wextra", "-MMD", "-MF", dep}
+			args := []string{"-c", stdFlag}
+			args = append(args, t.Flags...)
+			args = append(args, "-MMD", "-MF", dep)
 			args = append(args, flags...)
 			for _, inc := range includes {
 				args = append(args, "-I", inc)
