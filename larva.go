@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/BurntSushi/toml"
 )
@@ -154,6 +155,7 @@ func main() {
 // --- Build logic ---
 
 func doBuild() {
+	buildStart := time.Now()
 	os.MkdirAll(buildDir, 0o755)
 	os.MkdirAll(cacheDir, 0o755)
 
@@ -186,7 +188,8 @@ func doBuild() {
 	}
 
 	doPostBuild()
-	printSuccess("Build succeeded.")
+	elapsed := time.Since(buildStart)
+	printSuccess(fmt.Sprintf("Build succeeded in %s.", formatDuration(elapsed)))
 }
 
 func buildTarget(name string, t Target) []string {
@@ -518,6 +521,19 @@ func expandVars(s string) string {
 		s = strings.ReplaceAll(s, "{"+k+"}", v)
 	}
 	return s
+}
+
+func formatDuration(d time.Duration) string {
+	if d < time.Second {
+		return fmt.Sprintf("%dms", d.Milliseconds())
+	}
+	totalSeconds := int(d.Seconds())
+	if totalSeconds < 60 {
+		return fmt.Sprintf("%.2fs", d.Seconds())
+	}
+	minutes := totalSeconds / 60
+	seconds := totalSeconds % 60
+	return fmt.Sprintf("%dm %ds", minutes, seconds)
 }
 
 func exeName(name string) string {
