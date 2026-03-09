@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/md5"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -142,6 +143,8 @@ func main() {
 		doClean()
 	case "vs":
 		doGenerateVS()
+	case "lsp":
+		doGenerateCompileCommands()
 	default:
 		// Check custom commands
 		if c, ok := cfg.Commands[cmd]; ok {
@@ -359,6 +362,7 @@ func printHelp() {
 	fmt.Printf("  %s    Optimized release build\n", teal("release"))
 	fmt.Printf("  %s      Remove build artifacts\n", teal("clean"))
 	fmt.Printf("  %s         Generate Visual Studio NMake solution\n", teal("vs"))
+	fmt.Printf("  %s        Generate compile_commands.json for LSP\n", teal("lsp"))
 	fmt.Printf("\n")
 	fmt.Printf("Flags:\n")
 	fmt.Printf("  %s     Show this help message\n", teal("--help"))
@@ -373,6 +377,7 @@ func printUsage() {
 	fmt.Printf("  %s      Debug build (default)\n", teal("build"))
 	fmt.Printf("  %s    Optimized release build\n", teal("release"))
 	fmt.Printf("  %s         Generate Visual Studio solution\n", teal("vs"))
+	fmt.Printf("  %s        Generate compile_commands.json for LSP\n", teal("lsp"))
 	for name, c := range cfg.Commands {
 		fmt.Printf("  %s %s\n", teal(fmt.Sprintf("%-10s", name)), c.Description)
 	}
@@ -552,6 +557,97 @@ func run(name string, args ...string) {
 		printError("FAILED:", err)
 		os.Exit(1)
 	}
+}
+
+// --- compile_commands.json Generation ---
+
+type CompileCommand struct {
+	Directory string `json:"directory"`
+	Command   string `json:"command"`
+	File      string `json:"file"`
+}
+
+func doGenerateCompileCommands() {
+	cwd, _ := os.Getwd()
+	var commands []CompileCommand
+
+	for _, name := range targetBuildOrder() {
+		t := cfg.Targets[name]
+		compiler, stdFlag := resolveCompiler(t.Language)
+
+		// Resolve sources
+		var sources []string
+		for _, pat := range t.Sources {
+			matches, _ := filepath.Glob(pat)
+			sources = append(sources, matches...)
+		}
+
+		// Resolve includes
+		includes := t.Includes
+		systemIncludes := t.SystemIncludes
+		if p, ok := t.Platform[plat]; ok {
+			includes = append(includes, p.Includes...)
+			systemIncludes = append(systemIncludes, p.SystemIncludes...)
+		}
+
+		// Resolve flags
+		var flags []string
+		if mode == "release" {
+			flags = t.Release.Flags
+		} else {
+			flags = t.Debug.Flags
+		}
+		for i, f := range flags {
+			flags[i] = expandVars(f)
+		}
+
+		for _, src := range sources {
+			var args []string
+			args = append(args, compiler, "-c", stdFlag)
+			args = append(args, t.Flags...)
+			args = append(args, flags...)
+			for _, inc := range includes {
+				args = append(args, "-I", inc)
+			}
+			for _, inc := range systemIncludes {
+				args = append(args, "-isystem", inc)
+			}
+			args = append(args, src)
+
+			commands = append(commands, CompileCommand{
+				Directory: filepath.ToSlash(cwd),
+				Command:   strings.Join(args, " "),
+				File:      filepath.ToSlash(src),
+			})
+		}
+	}
+
+	data, err := json.MarshalIndent(commands, "", "  ")
+	if err != nil {
+		printError("error:", err)
+		os.Exit(1)
+	}
+
+	os.WriteFile("compile_commands.json", data, 0o644)
+	printSuccess("Generated compile_commands.json")
+}
+
+func targetBuildOrder() []string {
+	var order []string
+	for name, t := range cfg.Targets {
+		if t.Kind == "executable" {
+			for _, dep := range t.Deps {
+				order = append(order, dep)
+			}
+			order = append(order, name)
+			return order
+		}
+	}
+	// Fallback: just return all targets
+	for name := range cfg.Targets {
+		order = append(order, name)
+	}
+	return order
 }
 
 // --- VS Solution Generation ---
