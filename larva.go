@@ -137,6 +137,9 @@ func main() {
 	case "play":
 		doBuild()
 		doExec()
+	case "debug":
+		doBuild()
+		doDebug()
 	case "assets":
 		doPostBuild()
 	case "clean":
@@ -322,6 +325,18 @@ func doExec() {
 	cmd.Run()
 }
 
+func doDebug() {
+	exe, _ := filepath.Abs(filepath.Join(buildDir, exeName(cfg.Project.Name)))
+	dir, _ := filepath.Abs(buildDir)
+	printRunning("gdb " + exe)
+	cmd := exec.Command("gdb", "-tui", "-ex", "break main", "-ex", "run", exe)
+	cmd.Dir = dir
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+	cmd.Run()
+}
+
 func doClean() {
 	if c, ok := cfg.Commands["clean"]; ok {
 		for _, dir := range c.Remove {
@@ -360,6 +375,7 @@ func printHelp() {
 	fmt.Printf("Commands:\n")
 	fmt.Printf("  %s      Debug build (default)\n", teal("build"))
 	fmt.Printf("  %s    Optimized release build\n", teal("release"))
+	fmt.Printf("  %s      Build and launch gdb with a breakpoint at main\n", teal("debug"))
 	fmt.Printf("  %s      Remove build artifacts\n", teal("clean"))
 	fmt.Printf("  %s         Generate Visual Studio NMake solution\n", teal("vs"))
 	fmt.Printf("  %s        Generate compile_commands.json for LSP\n", teal("lsp"))
