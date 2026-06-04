@@ -333,7 +333,16 @@ func doDebug() {
 	exe, _ := filepath.Abs(filepath.Join(buildDir, exeName(cfg.Project.Name)))
 	dir, _ := filepath.Abs(buildDir)
 	printRunning("gdb " + exe)
-	cmd := exec.Command("gdb", "-tui", "-ex", "break main", "-ex", "run", exe)
+
+	args := []string{"-tui"}
+	if plat == "windows" {
+		// Give the inferior its own console — avoids STATUS_DLL_INIT_FAILED
+		// (0xc0000142) during startup when the program shares gdb's console.
+		args = append(args, "-ex", "set new-console on")
+	}
+	args = append(args, "-ex", "break main", "-ex", "run", exe)
+
+	cmd := exec.Command("gdb", args...)
 	cmd.Dir = dir
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
