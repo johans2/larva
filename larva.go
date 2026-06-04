@@ -147,7 +147,7 @@ func main() {
 	case "vs":
 		doGenerateVS()
 	case "lsp":
-		doGenerateCompileCommands()
+		doGenerateCompileCommands(true)
 	default:
 		// Check custom commands
 		if c, ok := cfg.Commands[cmd]; ok {
@@ -194,6 +194,10 @@ func doBuild() {
 	}
 
 	doPostBuild()
+
+	// Keep the compilation database in sync with the sources on every build
+	doGenerateCompileCommands(false)
+
 	elapsed := time.Since(buildStart)
 	printSuccess(fmt.Sprintf("Build succeeded in %s.", formatDuration(elapsed)))
 }
@@ -578,12 +582,12 @@ func run(name string, args ...string) {
 // --- compile_commands.json Generation ---
 
 type CompileCommand struct {
-	Directory string `json:"directory"`
-	Command   string `json:"command"`
-	File      string `json:"file"`
+	Directory string   `json:"directory"`
+	Arguments []string `json:"arguments"`
+	File      string   `json:"file"`
 }
 
-func doGenerateCompileCommands() {
+func doGenerateCompileCommands(verbose bool) {
 	cwd, _ := os.Getwd()
 	var commands []CompileCommand
 
@@ -618,22 +622,23 @@ func doGenerateCompileCommands() {
 		}
 
 		for _, src := range sources {
+			src = filepath.ToSlash(src)
 			var args []string
 			args = append(args, compiler, "-c", stdFlag)
 			args = append(args, t.Flags...)
 			args = append(args, flags...)
 			for _, inc := range includes {
-				args = append(args, "-I", inc)
+				args = append(args, "-I", filepath.ToSlash(inc))
 			}
 			for _, inc := range systemIncludes {
-				args = append(args, "-isystem", inc)
+				args = append(args, "-isystem", filepath.ToSlash(inc))
 			}
 			args = append(args, src)
 
 			commands = append(commands, CompileCommand{
 				Directory: filepath.ToSlash(cwd),
-				Command:   strings.Join(args, " "),
-				File:      filepath.ToSlash(src),
+				Arguments: args,
+				File:      src,
 			})
 		}
 	}
@@ -645,7 +650,9 @@ func doGenerateCompileCommands() {
 	}
 
 	os.WriteFile("compile_commands.json", data, 0o644)
-	printSuccess("Generated compile_commands.json")
+	if verbose {
+		printSuccess("Generated compile_commands.json")
+	}
 }
 
 func targetBuildOrder() []string {
