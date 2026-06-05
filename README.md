@@ -151,6 +151,8 @@ steps = [
 
 **`[[post_build]]`**
 - `target` — which target this runs after.
+- `name` — label for this step in the build summary printed after a successful
+  build. Defaults to the command's executable name (e.g. `cocoon`), or `copy`.
 - `copy` — glob patterns, copied into the output dir (skipped if dest is up to date).
 - `run_linux` / `run_windows` — shell command run after the copy step.
 

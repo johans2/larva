@@ -56,6 +56,7 @@ type BuildMode struct {
 }
 
 type PostBuild struct {
+	Name       string   `toml:"name"` // label in the build summary; defaults to the command name
 	Target     string   `toml:"target"`
 	Copy       []string `toml:"copy"`
 	RunLinux   string   `toml:"run_linux"`
@@ -158,6 +159,31 @@ func main() {
 	}
 }
 
+// --- Build step timing ---
+
+type buildStep struct {
+	name     string
+	duration time.Duration
+}
+
+var buildSteps []buildStep
+
+func recordStep(name string, d time.Duration) {
+	buildSteps = append(buildSteps, buildStep{name, d})
+}
+
+func printStepSummary() {
+	width := 0
+	for _, s := range buildSteps {
+		if len(s.name) > width {
+			width = len(s.name)
+		}
+	}
+	for _, s := range buildSteps {
+		fmt.Printf("  %s %s\n", dim(fmt.Sprintf("%-*s", width, s.name)), teal(formatDuration(s.duration)))
+	}
+}
+
 // --- Build logic ---
 
 func doBuild() {
@@ -180,9 +206,13 @@ func doBuild() {
 	if mainTarget != "" {
 		t := cfg.Targets[mainTarget]
 		for _, dep := range t.Deps {
+			stepStart := time.Now()
 			built[dep] = buildTarget(dep, cfg.Targets[dep])
+			recordStep("compile "+dep, time.Since(stepStart))
 		}
+		stepStart := time.Now()
 		built[mainTarget] = buildTarget(mainTarget, t)
+		recordStep("compile "+mainTarget, time.Since(stepStart))
 
 		// Link
 		var allObjects []string
@@ -190,16 +220,21 @@ func doBuild() {
 			allObjects = append(allObjects, built[dep]...)
 		}
 		allObjects = append(allObjects, built[mainTarget]...)
+		stepStart = time.Now()
 		linkTarget(t, allObjects)
+		recordStep("link", time.Since(stepStart))
 	}
 
 	doPostBuild()
 
 	// Keep the compilation database in sync with the sources on every build
+	stepStart := time.Now()
 	doGenerateCompileCommands(false)
+	recordStep("compile_commands", time.Since(stepStart))
 
 	elapsed := time.Since(buildStart)
 	printSuccess(fmt.Sprintf("Build succeeded in %s.", formatDuration(elapsed)))
+	printStepSummary()
 }
 
 func buildTarget(name string, t Target) []string {
@@ -285,6 +320,19 @@ func linkTarget(t Target, objects []string) {
 
 func doPostBuild() {
 	for _, pb := range cfg.PostBuild {
+		// Resolve the platform command up front so the summary can name the step.
+		cmdStr := ""
+		if plat == "windows" {
+			cmdStr = pb.RunWindows
+		} else {
+			cmdStr = pb.RunLinux
+		}
+		if cmdStr == "" && len(pb.Copy) == 0 {
+			continue
+		}
+
+		stepStart := time.Now()
+
 		// Copy files
 		for _, pat := range pb.Copy {
 			files, _ := filepath.Glob(pat)
@@ -303,18 +351,27 @@ func doPostBuild() {
 		}
 
 		// Run platform command
-		cmdStr := ""
-		if plat == "windows" {
-			cmdStr = pb.RunWindows
-		} else {
-			cmdStr = pb.RunLinux
-		}
 		if cmdStr != "" {
 			cmdStr = expandVars(cmdStr)
 			parts := strings.Fields(cmdStr)
 			run(parts[0], parts[1:]...)
 		}
+
+		recordStep(postBuildStepName(pb, cmdStr), time.Since(stepStart))
 	}
+}
+
+// postBuildStepName labels a post-build entry in the build summary: the
+// explicit name if given, else the bare command name, else "copy".
+func postBuildStepName(pb PostBuild, cmdStr string) string {
+	if pb.Name != "" {
+		return pb.Name
+	}
+	if fields := strings.Fields(cmdStr); len(fields) > 0 {
+		base := filepath.Base(fields[0])
+		return strings.TrimSuffix(base, filepath.Ext(base))
+	}
+	return "copy"
 }
 
 func doExec() {
