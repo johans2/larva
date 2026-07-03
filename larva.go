@@ -44,11 +44,12 @@ type Target struct {
 }
 
 type Platform struct {
-	Includes       []string `toml:"includes"`
-	SystemIncludes []string `toml:"system_includes"`
-	LibDirs        []string `toml:"libdirs"`
-	Links          []string `toml:"links"`
-	Output         string   `toml:"output"`
+	Includes         []string `toml:"includes"`
+	SystemIncludes   []string `toml:"system_includes"`
+	LibDirs          []string `toml:"libdirs"`
+	Links            []string `toml:"links"`
+	ReleaseLinkFlags []string `toml:"release_link_flags"` // extra linker flags applied only in release builds
+	Output           string   `toml:"output"`
 }
 
 type BuildMode struct {
@@ -311,6 +312,9 @@ func linkTarget(t Target, objects []string) {
 		}
 		for _, link := range p.Links {
 			args = append(args, "-l"+link)
+		}
+		if mode == "release" {
+			args = append(args, p.ReleaseLinkFlags...)
 		}
 	}
 
