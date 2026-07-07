@@ -134,7 +134,8 @@ steps = [
 **`[project]`**
 - `name` — executable name (`.exe` suffix added automatically on Windows).
 - `compiler` — `gcc` (default) or `clang`.
-- `buildcache` — where `.o` / `.d` files are cached. Defaults to the target's `output` dir.
+- `buildcache` — where `.o` / `.d` files are cached, split per platform/mode as
+  `buildcache/<os>/<mode>`. Defaults to the mode-specific `output` dir if unset.
 - `vars` — user-defined substitutions. Referenced as `{name}` in flags and commands.
 
 **`[targets.<name>]`**
@@ -168,13 +169,24 @@ steps = [
 
 Available anywhere a flag or command string is used:
 - `{projectRoot}` — absolute path to the directory containing `larva.toml`.
-- `{output}` — the resolved output directory for the current platform.
+- `{output}` — the resolved output directory for the current platform *and* build
+  mode, e.g. `build/windows/debug` or `build/windows/release`.
 - `{exe}` — the final executable filename (includes `.exe` on Windows).
 - `{name}` — any key from `[project.vars]`.
 
+## Build layout
+
+Debug and release artifacts are kept apart so one never clobbers the other:
+
+- **Output:** the target's `output` dir gains a `<mode>` subdirectory, e.g.
+  `build/windows/debug` and `build/windows/release`.
+- **Cache:** when `buildcache` is set, `.o` / `.d` files are split by platform
+  and mode, e.g. `buildCache/windows/debug` and `buildCache/windows/release`.
+  When `buildcache` is unset, the cache shares the mode-specific output dir.
+
 ## How builds work
 
-- Object files land in `buildcache` (or `output` if unset).
+- Object files land in `buildcache` (or `output` if unset), split per build mode.
 - Incremental: each source has a `.d` file generated with `-MMD`, so header
   edits trigger re-compilation of just the affected translation units.
 - Dependencies (`deps`) are built first, then the main target, then linked.

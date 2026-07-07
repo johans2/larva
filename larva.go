@@ -3,11 +3,13 @@ package main
 import (
 	"crypto/md5"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -75,11 +77,12 @@ type Command struct {
 const version = "0.1.0"
 
 var (
-	cfg      Config
-	plat     string
-	mode     string // "debug" or "release"
-	buildDir string
-	cacheDir string
+	cfg         Config
+	plat        string
+	mode        string // "debug" or "release"
+	buildDir    string
+	cacheDir    string
+	projectRoot string // absolute path of the directory containing larva.toml
 )
 
 func main() {
@@ -99,10 +102,17 @@ func main() {
 		return
 	}
 
+	// Resolve the project root once; every {projectRoot} expansion and
+	// executable path is derived from it.
+	root, err := os.Getwd()
+	if err != nil {
+		fatalf("cannot determine working directory: %v", err)
+	}
+	projectRoot = root
+
 	// Parse config
 	if _, err := toml.DecodeFile("larva.toml", &cfg); err != nil {
-		printError("error:", err)
-		os.Exit(1)
+		fatalf("reading larva.toml: %v", err)
 	}
 
 	// Detect platform
@@ -118,18 +128,24 @@ func main() {
 	}
 
 	// Resolve build dir from the main executable target
-	for _, t := range cfg.Targets {
-		if t.Kind == "executable" {
-			if p, ok := t.Platform[plat]; ok && p.Output != "" {
-				buildDir = p.Output
-				break
-			}
+	if _, t, ok := findMainExecutable(); ok {
+		if p, ok := t.Platform[plat]; ok && p.Output != "" {
+			buildDir = p.Output
 		}
 	}
 
-	// Resolve cache dir for object files (defaults to buildDir if not set)
-	cacheDir = cfg.Project.BuildCache
-	if cacheDir == "" {
+	// Separate debug and release artifacts into their own subdirectory:
+	// build/<os>/<mode>. The <os> component is already baked into the
+	// target's output path, so we only append the mode here.
+	buildDir = filepath.Join(buildDir, mode)
+
+	// Resolve cache dir for object files. When buildcache is set explicitly,
+	// split it by platform and mode (buildCache/<os>/<mode>) so debug and
+	// release caches never collide. When unset, it shares the mode-specific
+	// build output dir.
+	if cfg.Project.BuildCache != "" {
+		cacheDir = filepath.Join(cfg.Project.BuildCache, plat, mode)
+	} else {
 		cacheDir = buildDir
 	}
 
@@ -189,47 +205,43 @@ func printStepSummary() {
 
 func doBuild() {
 	buildStart := time.Now()
-	os.MkdirAll(buildDir, 0o755)
-	os.MkdirAll(cacheDir, 0o755)
+	mustMkdir(buildDir)
+	mustMkdir(cacheDir)
 
-	// Build all targets in dependency order
-	built := map[string][]string{} // target name -> object files
-	mainTarget := ""
-
-	// Find the executable target
-	for name, t := range cfg.Targets {
-		if t.Kind == "executable" {
-			mainTarget = name
-		}
+	mainTarget, t, ok := findMainExecutable()
+	if !ok {
+		fatalf("no executable target found in larva.toml")
 	}
 
-	// Build dependencies first, then main
-	if mainTarget != "" {
-		t := cfg.Targets[mainTarget]
-		for _, dep := range t.Deps {
-			stepStart := time.Now()
-			built[dep] = buildTarget(dep, cfg.Targets[dep])
-			recordStep("compile "+dep, time.Since(stepStart))
+	// Build dependencies first, then the main target.
+	built := map[string][]string{} // target name -> object files
+	for _, dep := range t.Deps {
+		dt, exists := cfg.Targets[dep]
+		if !exists {
+			fatalf("target %q lists unknown dependency %q", mainTarget, dep)
 		}
 		stepStart := time.Now()
-		built[mainTarget] = buildTarget(mainTarget, t)
-		recordStep("compile "+mainTarget, time.Since(stepStart))
-
-		// Link
-		var allObjects []string
-		for _, dep := range t.Deps {
-			allObjects = append(allObjects, built[dep]...)
-		}
-		allObjects = append(allObjects, built[mainTarget]...)
-		stepStart = time.Now()
-		linkTarget(t, allObjects)
-		recordStep("link", time.Since(stepStart))
+		built[dep] = buildTarget(dep, dt, false)
+		recordStep("compile "+dep, time.Since(stepStart))
 	}
+	stepStart := time.Now()
+	built[mainTarget] = buildTarget(mainTarget, t, true)
+	recordStep("compile "+mainTarget, time.Since(stepStart))
+
+	// Link
+	var allObjects []string
+	for _, dep := range t.Deps {
+		allObjects = append(allObjects, built[dep]...)
+	}
+	allObjects = append(allObjects, built[mainTarget]...)
+	stepStart = time.Now()
+	linkTarget(t, allObjects)
+	recordStep("link", time.Since(stepStart))
 
 	doPostBuild()
 
 	// Keep the compilation database in sync with the sources on every build
-	stepStart := time.Now()
+	stepStart = time.Now()
 	doGenerateCompileCommands(false)
 	recordStep("compile_commands", time.Since(stepStart))
 
@@ -238,50 +250,33 @@ func doBuild() {
 	printStepSummary()
 }
 
-func buildTarget(name string, t Target) []string {
-	// Resolve sources (expand globs)
-	var sources []string
-	for _, pat := range t.Sources {
-		matches, _ := filepath.Glob(pat)
-		sources = append(sources, matches...)
-	}
+func buildTarget(name string, t Target, isMain bool) []string {
+	sources := resolveSources(t)
 	if len(sources) == 0 {
-		printError("warning:", "no sources found for target '"+name+"'")
+		// An executable with nothing to compile can't link, so that's fatal;
+		// a source-less dependency (e.g. a header-only interface target, or one
+		// whose sources are platform-specific) is legitimate — warn and skip it.
+		if isMain {
+			fatalf("no sources found for executable target %q", name)
+		}
+		printWarn("no sources found for target %q — skipping", name)
 		return nil
 	}
 
-	// Resolve includes
-	includes := t.Includes
-	systemIncludes := t.SystemIncludes
-	if p, ok := t.Platform[plat]; ok {
-		includes = append(includes, p.Includes...)
-		systemIncludes = append(systemIncludes, p.SystemIncludes...)
-	}
-
-	// Resolve flags
-	var flags []string
-	if mode == "release" {
-		flags = t.Release.Flags
-	} else {
-		flags = t.Debug.Flags
-	}
-
-	for i, f := range flags {
-		flags[i] = expandVars(f)
-	}
-
-	// Determine compiler and standard
+	includes, systemIncludes := resolveIncludes(t)
+	flags := modeFlags(t)
+	baseFlags := expandAll(t.Flags)
 	compiler, stdFlag := resolveCompiler(t.Language)
-	ext := sourceExt(t.Language)
 
 	// Compile each source
 	var objects []string
 	for _, src := range sources {
-		obj := filepath.Join(cacheDir, strings.TrimSuffix(filepath.Base(src), ext)+".o")
+		obj := objectPath(src)
 		dep := strings.TrimSuffix(obj, ".o") + ".d"
 		if needsRecompile(src, obj, dep) {
+			mustMkdir(filepath.Dir(obj))
 			args := []string{"-c", stdFlag}
-			args = append(args, t.Flags...)
+			args = append(args, baseFlags...)
 			args = append(args, "-MMD", "-MF", dep)
 			args = append(args, flags...)
 			for _, inc := range includes {
@@ -339,13 +334,21 @@ func doPostBuild() {
 
 		// Copy files
 		for _, pat := range pb.Copy {
-			files, _ := filepath.Glob(pat)
+			files, err := filepath.Glob(pat)
+			if err != nil {
+				fatalf("invalid copy pattern %q: %v", pat, err)
+			}
 			copied := 0
 			for _, f := range files {
 				dst := filepath.Join(buildDir, filepath.Base(f))
 				if isNewer(f, dst) {
-					data, _ := os.ReadFile(f)
-					os.WriteFile(dst, data, 0o644)
+					data, err := os.ReadFile(f)
+					if err != nil {
+						fatalf("copying %s: %v", f, err)
+					}
+					if err := os.WriteFile(dst, data, 0o644); err != nil {
+						fatalf("writing %s: %v", dst, err)
+					}
 					copied++
 				}
 			}
@@ -358,7 +361,13 @@ func doPostBuild() {
 		if cmdStr != "" {
 			cmdStr = expandVars(cmdStr)
 			parts := strings.Fields(cmdStr)
-			run(parts[0], parts[1:]...)
+			if len(parts) == 0 {
+				// The command expanded to nothing (e.g. an empty variable);
+				// there's nothing to run, so skip it rather than crash.
+				printWarn("post-build command expanded to empty — skipping")
+			} else {
+				run(parts[0], parts[1:]...)
+			}
 		}
 
 		recordStep(postBuildStepName(pb, cmdStr), time.Since(stepStart))
@@ -379,20 +388,13 @@ func postBuildStepName(pb PostBuild, cmdStr string) string {
 }
 
 func doExec() {
-	exe, _ := filepath.Abs(filepath.Join(buildDir, exeName(cfg.Project.Name)))
-	dir, _ := filepath.Abs(buildDir)
+	exe := filepath.Join(absBuildDir(), exeName(cfg.Project.Name))
 	printRunning(exe)
-	cmd := exec.Command(exe)
-	cmd.Dir = dir
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Stdin = os.Stdin
-	cmd.Run()
+	runInteractive(absBuildDir(), exe)
 }
 
 func doDebug() {
-	exe, _ := filepath.Abs(filepath.Join(buildDir, exeName(cfg.Project.Name)))
-	dir, _ := filepath.Abs(buildDir)
+	exe := filepath.Join(absBuildDir(), exeName(cfg.Project.Name))
 	printRunning("gdb " + exe)
 
 	args := []string{"-tui"}
@@ -403,18 +405,15 @@ func doDebug() {
 	}
 	args = append(args, "-ex", "break main", "-ex", "run", exe)
 
-	cmd := exec.Command("gdb", args...)
-	cmd.Dir = dir
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Stdin = os.Stdin
-	cmd.Run()
+	runInteractive(absBuildDir(), "gdb", args...)
 }
 
 func doClean() {
 	if c, ok := cfg.Commands["clean"]; ok {
 		for _, dir := range c.Remove {
-			os.RemoveAll(dir)
+			if err := os.RemoveAll(dir); err != nil {
+				fatalf("removing %s: %v", dir, err)
+			}
 			printRemoved(dir)
 		}
 	}
@@ -429,16 +428,11 @@ func doCommand(c Command) {
 		case step == "post_build":
 			doPostBuild()
 		case strings.HasPrefix(step, "exec:"):
-			p := strings.TrimPrefix(step, "exec:")
-			p = expandVars(p)
-			absPath, _ := filepath.Abs(p)
-			absDir, _ := filepath.Abs(buildDir)
-			cmd := exec.Command(absPath)
-			cmd.Dir = absDir
-			cmd.Stdout = os.Stdout
-			cmd.Stderr = os.Stderr
-			cmd.Stdin = os.Stdin
-			cmd.Run()
+			p := expandVars(strings.TrimPrefix(step, "exec:"))
+			if !filepath.IsAbs(p) {
+				p = filepath.Join(projectRoot, p)
+			}
+			runInteractive(absBuildDir(), p)
 		}
 	}
 }
@@ -478,12 +472,12 @@ func printUsage() {
 // --- Colors (256-color ANSI) ---
 
 const (
-	colorReset   = "\033[0m"
-	colorTeal    = "\033[38;5;37m"  // main larva color — green/blue teal
-	colorDim     = "\033[38;5;245m" // dimmed default prints
-	colorBright  = "\033[38;5;48m"  // bright green for success
-	colorErr     = "\033[38;5;208m" // orange-red for errors
-	colorBold    = "\033[1m"
+	colorReset  = "\033[0m"
+	colorTeal   = "\033[38;5;37m"  // main larva color — green/blue teal
+	colorDim    = "\033[38;5;245m" // dimmed default prints
+	colorBright = "\033[38;5;48m"  // bright green for success
+	colorErr    = "\033[38;5;208m" // orange-red for errors
+	colorBold   = "\033[1m"
 )
 
 func teal(s string) string   { return colorTeal + s + colorReset }
@@ -513,12 +507,12 @@ func printSuccess(msg string) {
 	fmt.Println(bright(msg))
 }
 
-func printError(msg string, detail interface{}) {
-	fmt.Fprintf(os.Stderr, "%s %v\n", errclr(msg), detail)
-}
-
 func printCmd(name string, args string) {
 	fmt.Printf("  %s %s\n", teal(name), dim(args))
+}
+
+func printWarn(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "%s %s\n", colorErr+"warning:"+colorReset, fmt.Sprintf(format, args...))
 }
 
 // --- Helpers ---
@@ -539,11 +533,135 @@ func resolveCompiler(lang string) (compiler, stdFlag string) {
 	}
 }
 
-func sourceExt(lang string) string {
-	if strings.HasPrefix(lang, "c++") {
-		return ".cpp"
+// fatalf prints a clear error message and aborts. All unrecoverable failures
+// funnel through here so the user always gets a single, consistent line.
+func fatalf(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "%s %s\n", errclr("error:"), fmt.Sprintf(format, args...))
+	os.Exit(1)
+}
+
+// mustMkdir creates a directory tree or aborts with a clear error.
+func mustMkdir(dir string) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		fatalf("creating %s: %v", dir, err)
 	}
-	return ".c"
+}
+
+// runInteractive launches a program with the current stdio attached (used for
+// play/debug/exec steps). A failure to start it (e.g. the binary or gdb is
+// missing) is reported as a larva error and aborts. If the program starts but
+// exits non-zero, that's the program's own status, not a larva error, so we
+// don't print "error:" — but we do propagate its exit code so a failing
+// exec: step fails the command (and CI sees it) instead of looking like success.
+func runInteractive(dir, name string, args ...string) {
+	cmd := exec.Command(name, args...)
+	cmd.Dir = dir
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+	if err := cmd.Run(); err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			os.Exit(exitErr.ExitCode())
+		}
+		fatalf("running %s: %v", name, err)
+	}
+}
+
+// findMainExecutable returns the project's single executable target. Target
+// names are sorted so the choice is deterministic even if a project were to
+// declare more than one executable.
+func findMainExecutable() (string, Target, bool) {
+	names := make([]string, 0, len(cfg.Targets))
+	for name := range cfg.Targets {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if cfg.Targets[name].Kind == "executable" {
+			return name, cfg.Targets[name], true
+		}
+	}
+	return "", Target{}, false
+}
+
+// resolveSources expands a target's source globs into concrete file paths.
+func resolveSources(t Target) []string {
+	var sources []string
+	for _, pat := range t.Sources {
+		matches, err := filepath.Glob(pat)
+		if err != nil {
+			fatalf("invalid source pattern %q: %v", pat, err)
+		}
+		sources = append(sources, matches...)
+	}
+	return sources
+}
+
+// resolveIncludes merges a target's base include paths with its platform-
+// specific ones. Fresh slices are returned so the parsed config is never
+// mutated.
+func resolveIncludes(t Target) (includes, systemIncludes []string) {
+	includes = append(includes, t.Includes...)
+	systemIncludes = append(systemIncludes, t.SystemIncludes...)
+	if p, ok := t.Platform[plat]; ok {
+		includes = append(includes, p.Includes...)
+		systemIncludes = append(systemIncludes, p.SystemIncludes...)
+	}
+	return includes, systemIncludes
+}
+
+// modeFlags returns the debug or release compile flags for the current build
+// mode, variable-expanded. The result is a fresh slice — the parsed config is
+// never mutated.
+func modeFlags(t Target) []string {
+	if mode == "release" {
+		return expandAll(t.Release.Flags)
+	}
+	return expandAll(t.Debug.Flags)
+}
+
+// expandAll variable-expands every string in a slice, returning a fresh slice.
+func expandAll(in []string) []string {
+	out := make([]string, len(in))
+	for i, s := range in {
+		out[i] = expandVars(s)
+	}
+	return out
+}
+
+// objectPath maps a source file to its cached object path. The source's full
+// relative path — directory layout and extension — is preserved under cacheDir
+// and ".o" is appended, so no two distinct sources ever share an object file:
+// foo.c and foo.cpp in one directory become foo.c.o and foo.cpp.o, and files
+// with the same name in different directories keep their directories.
+func objectPath(src string) string {
+	rel := filepath.Clean(src)
+	sep := string(filepath.Separator)
+	// Turn a "C:" drive prefix into a "C" path component so sources on
+	// different volumes don't collide once the leading separators are stripped.
+	if vol := filepath.VolumeName(rel); vol != "" {
+		rel = strings.TrimRight(vol, `:\/`) + sep + strings.TrimLeft(rel[len(vol):], `/\`)
+	}
+	rel = strings.TrimLeft(rel, `/\`)
+	// Turn every ".." element into "__" so the object always lands under
+	// cacheDir even for sources reached via a parent directory.
+	rel = strings.ReplaceAll(rel, ".."+sep, "__"+sep)
+	return filepath.Join(cacheDir, rel+".o")
+}
+
+// isDriveLetter reports whether b is an ASCII letter, i.e. a Windows drive
+// letter as in "C:".
+func isDriveLetter(b byte) bool {
+	return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z')
+}
+
+// absBuildDir returns the build output directory as an absolute path.
+func absBuildDir() string {
+	if filepath.IsAbs(buildDir) {
+		return buildDir
+	}
+	return filepath.Join(projectRoot, buildDir)
 }
 
 func isNewer(src, dst string) bool {
@@ -595,9 +713,17 @@ func parseDeps(depFile string) []string {
 	content := strings.ReplaceAll(string(data), "\\\n", " ")
 	content = strings.ReplaceAll(content, "\\\r\n", " ")
 
-	// Strip the "target:" prefix
-	if idx := strings.Index(content, ":"); idx >= 0 {
-		content = content[idx+1:]
+	// Strip the "target:" prefix. On Windows the target is an object path that
+	// may itself begin with a drive letter ("C:\cache\x.o: dep.h ..."), so skip
+	// a leading "X:" before searching for the colon that separates target from
+	// deps — otherwise we'd split on the drive colon and drop every dependency.
+	content = strings.TrimLeft(content, " \t\r\n")
+	start := 0
+	if len(content) >= 2 && content[1] == ':' && isDriveLetter(content[0]) {
+		start = 2
+	}
+	if idx := strings.IndexByte(content[start:], ':'); idx >= 0 {
+		content = content[start+idx+1:]
 	}
 
 	var deps []string
@@ -608,8 +734,7 @@ func parseDeps(depFile string) []string {
 }
 
 func expandVars(s string) string {
-	cwd, _ := os.Getwd()
-	s = strings.ReplaceAll(s, "{projectRoot}", filepath.ToSlash(cwd))
+	s = strings.ReplaceAll(s, "{projectRoot}", filepath.ToSlash(projectRoot))
 	s = strings.ReplaceAll(s, "{output}", buildDir)
 	s = strings.ReplaceAll(s, "{exe}", exeName(cfg.Project.Name))
 	for k, v := range cfg.Project.Vars {
@@ -644,8 +769,7 @@ func run(name string, args ...string) {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
-		printError("FAILED:", err)
-		os.Exit(1)
+		fatalf("%s failed: %v", name, err)
 	}
 }
 
@@ -658,44 +782,21 @@ type CompileCommand struct {
 }
 
 func doGenerateCompileCommands(verbose bool) {
-	cwd, _ := os.Getwd()
 	var commands []CompileCommand
 
 	for _, name := range targetBuildOrder() {
 		t := cfg.Targets[name]
 		compiler, stdFlag := resolveCompiler(t.Language)
-
-		// Resolve sources
-		var sources []string
-		for _, pat := range t.Sources {
-			matches, _ := filepath.Glob(pat)
-			sources = append(sources, matches...)
-		}
-
-		// Resolve includes
-		includes := t.Includes
-		systemIncludes := t.SystemIncludes
-		if p, ok := t.Platform[plat]; ok {
-			includes = append(includes, p.Includes...)
-			systemIncludes = append(systemIncludes, p.SystemIncludes...)
-		}
-
-		// Resolve flags
-		var flags []string
-		if mode == "release" {
-			flags = t.Release.Flags
-		} else {
-			flags = t.Debug.Flags
-		}
-		for i, f := range flags {
-			flags[i] = expandVars(f)
-		}
+		sources := resolveSources(t)
+		includes, systemIncludes := resolveIncludes(t)
+		flags := modeFlags(t)
+		baseFlags := expandAll(t.Flags)
 
 		for _, src := range sources {
 			src = filepath.ToSlash(src)
 			var args []string
 			args = append(args, compiler, "-c", stdFlag)
-			args = append(args, t.Flags...)
+			args = append(args, baseFlags...)
 			args = append(args, flags...)
 			for _, inc := range includes {
 				args = append(args, "-I", filepath.ToSlash(inc))
@@ -706,7 +807,7 @@ func doGenerateCompileCommands(verbose bool) {
 			args = append(args, src)
 
 			commands = append(commands, CompileCommand{
-				Directory: filepath.ToSlash(cwd),
+				Directory: filepath.ToSlash(projectRoot),
 				Arguments: args,
 				File:      src,
 			})
@@ -715,31 +816,31 @@ func doGenerateCompileCommands(verbose bool) {
 
 	data, err := json.MarshalIndent(commands, "", "  ")
 	if err != nil {
-		printError("error:", err)
-		os.Exit(1)
+		fatalf("generating compile_commands.json: %v", err)
 	}
 
-	os.WriteFile("compile_commands.json", data, 0o644)
+	if err := os.WriteFile("compile_commands.json", data, 0o644); err != nil {
+		fatalf("writing compile_commands.json: %v", err)
+	}
 	if verbose {
 		printSuccess("Generated compile_commands.json")
 	}
 }
 
 func targetBuildOrder() []string {
-	var order []string
-	for name, t := range cfg.Targets {
-		if t.Kind == "executable" {
-			for _, dep := range t.Deps {
-				order = append(order, dep)
-			}
-			order = append(order, name)
-			return order
+	name, t, ok := findMainExecutable()
+	if !ok {
+		// Fallback: all targets, sorted for a deterministic order.
+		order := make([]string, 0, len(cfg.Targets))
+		for n := range cfg.Targets {
+			order = append(order, n)
 		}
+		sort.Strings(order)
+		return order
 	}
-	// Fallback: just return all targets
-	for name := range cfg.Targets {
-		order = append(order, name)
-	}
+	order := make([]string, 0, len(t.Deps)+1)
+	order = append(order, t.Deps...)
+	order = append(order, name)
 	return order
 }
 
@@ -747,18 +848,9 @@ func targetBuildOrder() []string {
 
 func doGenerateVS() {
 	// Find the executable target
-	var mainName string
-	var mainTarget Target
-	for name, t := range cfg.Targets {
-		if t.Kind == "executable" {
-			mainName = name
-			mainTarget = t
-			break
-		}
-	}
-	if mainName == "" {
-		printError("error:", "no executable target found")
-		os.Exit(1)
+	_, mainTarget, ok := findMainExecutable()
+	if !ok {
+		fatalf("no executable target found in larva.toml")
 	}
 
 	projectName := cfg.Project.Name
@@ -835,21 +927,18 @@ func doGenerateVS() {
 	seen := map[string]bool{}
 
 	addSources := func(t Target) {
-		for _, pat := range t.Sources {
-			matches, _ := filepath.Glob(pat)
-			for _, m := range matches {
-				m = filepath.Clean(m)
-				if seen[m] {
-					continue
-				}
-				seen[m] = true
-				ext := strings.ToLower(filepath.Ext(m))
-				switch ext {
-				case ".cpp", ".cc", ".cxx", ".c":
-					compileFiles = append(compileFiles, m)
-				case ".h", ".hpp":
-					headerFiles = append(headerFiles, m)
-				}
+		for _, m := range resolveSources(t) {
+			m = filepath.Clean(m)
+			if seen[m] {
+				continue
+			}
+			seen[m] = true
+			ext := strings.ToLower(filepath.Ext(m))
+			switch ext {
+			case ".cpp", ".cc", ".cxx", ".c":
+				compileFiles = append(compileFiles, m)
+			case ".h", ".hpp":
+				headerFiles = append(headerFiles, m)
 			}
 		}
 	}
@@ -875,21 +964,28 @@ func doGenerateVS() {
 		}
 	}
 
-	// Resolve output exe path
-	outputExe := projectName + ".exe"
+	// Resolve output exe paths. Debug and release land in their own
+	// subdirectory (build/<os>/<mode>), matching the layout larva builds into.
+	debugOutputExe := filepath.FromSlash(filepath.Join("debug", projectName+".exe"))
+	releaseOutputExe := filepath.FromSlash(filepath.Join("release", projectName+".exe"))
 	if p, ok := mainTarget.Platform["windows"]; ok && p.Output != "" {
-		outputExe = filepath.FromSlash(filepath.Join(p.Output, projectName+".exe"))
+		debugOutputExe = filepath.FromSlash(filepath.Join(p.Output, "debug", projectName+".exe"))
+		releaseOutputExe = filepath.FromSlash(filepath.Join(p.Output, "release", projectName+".exe"))
 	}
 
 	// Write .vcxproj
 	vcxprojPath := projectName + ".vcxproj"
-	vcxproj := generateVcxproj(projectName, guid, includeStr, debugDefs, releaseDefs, outputExe, compileFiles, headerFiles)
-	os.WriteFile(vcxprojPath, []byte(vcxproj), 0o644)
+	vcxproj := generateVcxproj(projectName, guid, includeStr, debugDefs, releaseDefs, debugOutputExe, releaseOutputExe, compileFiles, headerFiles)
+	if err := os.WriteFile(vcxprojPath, []byte(vcxproj), 0o644); err != nil {
+		fatalf("writing %s: %v", vcxprojPath, err)
+	}
 
 	// Write .sln
 	slnPath := projectName + ".sln"
 	sln := generateSln(projectName, guid, vcxprojPath)
-	os.WriteFile(slnPath, []byte(sln), 0o644)
+	if err := os.WriteFile(slnPath, []byte(sln), 0o644); err != nil {
+		fatalf("writing %s: %v", slnPath, err)
+	}
 
 	printSuccess("Generated Visual Studio solution:")
 	fmt.Printf("  %s\n", teal(slnPath))
@@ -903,7 +999,7 @@ func projectGUID(name string) string {
 		h[8], h[9], h[10], h[11], h[12], h[13], h[14], h[15])
 }
 
-func generateVcxproj(name, guid, includes, debugDefs, releaseDefs, output string, compileFiles, headerFiles []string) string {
+func generateVcxproj(name, guid, includes, debugDefs, releaseDefs, debugOutput, releaseOutput string, compileFiles, headerFiles []string) string {
 	var b strings.Builder
 
 	b.WriteString("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n")
@@ -950,7 +1046,7 @@ func generateVcxproj(name, guid, includes, debugDefs, releaseDefs, output string
 	// NMake settings — Debug
 	b.WriteString("  <PropertyGroup Condition=\"'$(Configuration)|$(Platform)'=='Debug|x64'\">\n")
 	b.WriteString("    <NMakeBuildCommandLine>larva build</NMakeBuildCommandLine>\n")
-	b.WriteString(fmt.Sprintf("    <NMakeOutput>%s</NMakeOutput>\n", output))
+	b.WriteString(fmt.Sprintf("    <NMakeOutput>%s</NMakeOutput>\n", debugOutput))
 	b.WriteString("    <NMakeCleanCommandLine>larva clean</NMakeCleanCommandLine>\n")
 	b.WriteString("    <NMakeReBuildCommandLine>larva clean &amp;&amp; larva build</NMakeReBuildCommandLine>\n")
 	b.WriteString(fmt.Sprintf("    <NMakeIncludeSearchPath>%s</NMakeIncludeSearchPath>\n", includes))
@@ -960,7 +1056,7 @@ func generateVcxproj(name, guid, includes, debugDefs, releaseDefs, output string
 	// NMake settings — Release
 	b.WriteString("  <PropertyGroup Condition=\"'$(Configuration)|$(Platform)'=='Release|x64'\">\n")
 	b.WriteString("    <NMakeBuildCommandLine>larva release</NMakeBuildCommandLine>\n")
-	b.WriteString(fmt.Sprintf("    <NMakeOutput>%s</NMakeOutput>\n", output))
+	b.WriteString(fmt.Sprintf("    <NMakeOutput>%s</NMakeOutput>\n", releaseOutput))
 	b.WriteString("    <NMakeCleanCommandLine>larva clean</NMakeCleanCommandLine>\n")
 	b.WriteString("    <NMakeReBuildCommandLine>larva clean &amp;&amp; larva release</NMakeReBuildCommandLine>\n")
 	b.WriteString(fmt.Sprintf("    <NMakeIncludeSearchPath>%s</NMakeIncludeSearchPath>\n", includes))
