@@ -46,6 +46,7 @@ type Target struct {
 }
 
 type Platform struct {
+	Sources          []string `toml:"sources"` // extra source globs, appended to the target's own
 	Includes         []string `toml:"includes"`
 	SystemIncludes   []string `toml:"system_includes"`
 	LibDirs          []string `toml:"libdirs"`
@@ -585,10 +586,16 @@ func findMainExecutable() (string, Target, bool) {
 	return "", Target{}, false
 }
 
-// resolveSources expands a target's source globs into concrete file paths.
+// resolveSources expands a target's source globs into concrete file paths,
+// including any contributed by the current platform.
 func resolveSources(t Target) []string {
+	patterns := append([]string{}, t.Sources...)
+	if p, ok := t.Platform[plat]; ok {
+		patterns = append(patterns, p.Sources...)
+	}
+
 	var sources []string
-	for _, pat := range t.Sources {
+	for _, pat := range patterns {
 		matches, err := filepath.Glob(pat)
 		if err != nil {
 			fatalf("invalid source pattern %q: %v", pat, err)
